@@ -1,0 +1,10 @@
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# Generated forecast outputs
+forecasts_output.csv
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
