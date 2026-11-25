@@ -1,0 +1,314 @@
+# HANDOFF — CAMELS Dark Matter Halo Detection Pipeline
+
+> **Nota per l'AI ricevente:** questo documento è un handoff da una sessione precedente. Contiene (1) il contesto completo del progetto, (2) lo stato attuale del codice e dei risultati, (3) i prossimi passi concordati. Il progetto è un lavoro di tesi magistrale; il codice è in Python/Jupyter. Il relatore ha appena avuto un colloquio con l'autore e ha suggerito nuove direzioni metodologiche, descritte nella Sezione 3.
+Ogni formula o variabili che deve essere scritta in chat deve essere scritta così, esempio: $3\times3$.
+
+---
+
+## 1. Panoramica del progetto
+
+### 1.1 Obiettivo
+
+Costruire una **pipeline di deep learning + post-processing geometrico 3D** in grado di rivelare e caratterizzare aloni di materia oscura a partire da mappe bidimensionali di densità proiettata, e di produrre un **catalogo 3D di aloni con masse fisiche** ($M_\odot/h$), senza dipendere da cataloghi esterni per la calibrazione delle masse.
+
+L'ancoraggio fisico delle masse avviene tramite un fattore di conversione $\mathrm{mpu}_k$ (mass-per-unit) calcolato per ogni slice a partire dalla conservazione della massa delle particelle: $\mathrm{mpu}_k = n_k \cdot m_{\mathrm{DM}} / \sum \rho_k(x,y)$. Questa è la chiave metodologica del progetto: il rendering SPH conserva la massa totale, quindi moltiplicando la somma dei pixel di un blob denormalizzato per $\mathrm{mpu}_k$ si ottiene la massa fisica reale, senza consultare cataloghi di aloni esterni.
+
+### 1.2 Dataset
+
+- **Suite:** CAMELS LH (Latin Hypercube), simulazione IllustrisTNG.
+- **Snapshot:** 090, $z=0$.
+- **Box:** $L_{\text{box}} = 25\,\mathrm{Mpc}/h$ cubico, condizioni al contorno periodiche.
+- **Particelle DM:** $N = 2^{24} = 16{,}777{,}216$, massa individuale $m_{\mathrm{DM}}$ variabile tra simulazioni (dipende da $\Omega_m$, $h$).
+- **Cataloghi disponibili:** FoF (`Group`) e SubFind (`Subhalo`), in HDF5 (`groups_090.hdf5`).
+- **Simulazioni usate:** LH_100–LH_104 (train, 5 sim), LH_105 (validation, 1 sim), **LH_106 (test, congelato, `RUN_TEST=False` — mai eseguito finora)**.
+
+### 1.3 Struttura della pipeline (stato attuale)
+
+Tre notebook, in cascata:
+
+**NB1 — `make_input_patches`** *(Fase 1 e 2 della pipeline)*
+- Lettura coordinate `PartType1/Coordinates` da ckpc/h → Mpc/h (÷1000).
+- Lettura massa particellare da `MassTable` × $10^{10}$.
+- Calcolo smoothing length $h_i$ (kernel SPH, $k=32$ vicini) con `sphviewer2`, cachato su `.npz` con hash MD5.
+- Proiezione 2D: 25 slice di spessore $\Delta z = 1\,\mathrm{Mpc}/h$ lungo $z$; ogni slice → mappa $1024^2$ ($p_x \approx 0.02441\,\mathrm{Mpc}/h$).
+- Calcolo $\mathrm{mpu}_k$ per ogni slice.
+- Normalizzazione: $\log_{10}\rho$ + z-score robusto (mediana, semi-IQR 16–84); vuoti → `EMPTY_FILL = -3.0`.
+- Maschere target: dischi di raggio $R = \max(R_{200c} \cdot p_x,\, 1.5\,\mathrm{px})$ sui FoF halos sopra $M_{\mathrm{cut}} = N_{\min} \cdot m_{\mathrm{DM}}$ ($N_{\min} = 100$; per LH_105 $M_{\mathrm{cut}} \approx 9.63 \times 10^9\,M_\odot/h$).
+- Patching: $4\times4$ patch $256^2$ per slice → 400 patch per simulazione. Indice: $\text{idx} = s \cdot 16 + g_y \cdot 4 + g_x$.
+- Output: `X_patches.npy`, `Y_mask_patches.npy`, `mpu_per_slice.npy`, `dataset_info.json`.
+
+**NB2 — `vera_unet`** *(Fase 3)*
+- Split per simulazione (anti-data-leakage): train 5 sim (2000 patch), val 1 sim (400), test 1 sim (congelato).
+- U-Net minimale: depth=3, base_ch=32, **1.926.433 parametri**.
+- Loss: BCE pesata, $w = N_{\text{neg}}/N_{\text{pos}} \approx 342.5$ (calcolato solo sul train).
+- EMA ($d = 0.995$) su pesi **e** buffer BN (`running_mean`, `running_var`); copia `num_batches_tracked`.
+- AdamW ($\text{weight\_decay}=10^{-4}$), Cosine Annealing $\eta_0 = 10^{-3} \to \eta_{\min} = 10^{-5}$, 20 epoche.
+- Checkpoint su val AP (threshold-free). **Best epoch 17, val AP = 0.8464**.
+- Inferenza su LH_105, ricostruzione fette $1024^2$ via `tiles_to_slices`, salvataggio `val_prob_slices.npy`.
+- **NON scrive `chosen_threshold.json`** (spetta a NB3).
+- Scrive `candidate_thresholds.json` con le 4 soglie $[0.85, 0.90, 0.95, 0.99]$.
+
+**NB3 — `vera_conn`** *(Fase 4 e 5)*
+- Denormalizzazione: $\rho = 10^{X \cdot \sigma + \mu}$, con margine $X \le -2.9 \to 0$ (fix float32).
+- Estrazione blob 2D con mosaico periodico $3\times3$, labeling 8-connettività, centroide circolare (atan2), raggio equivalente $r_{\text{eq}} = \sqrt{A/\pi}$.
+- Linking 3D tra slice adiacenti: $\Delta s \in \{1,2\}$, scala $(1.0, 0.7)$, floor 3 px, connected components.
+- Catalogo 3D: massa totale, centroide mass-weighted, $R_{200}^{\text{est}} = (3M/4\pi \cdot 200 \rho_c)^{1/3}$, filtro area $A_{\text{tot}} \ge \text{area}_{3D}$.
+- Matching greedy 1-a-1 vs FoF: $d_{XY} \le \max(R_{200c}, 3\,\mathrm{px})$, $|\Delta z| \le 1\,\mathrm{Mpc}/h$.
+- Griglia $4\times3$ (4 soglie × 3 aree $\{4, 6, 12\}$), scelta **$(t^*, \text{area}^*) = (0.95, 4)$**.
+- Autopsia falsi positivi, transition analysis $0.99 \to 0.95$, HMF, test background.
+- Scrive `chosen_threshold.json`.
+
+### 1.4 Risultati chiave (baseline, $t=0.95$, area=4, su LH_105)
+
+| Metrica | Valore |
+|---|---|
+| Oggetti 3D predetti | 5.962 |
+| Coppie match | 3.846 |
+| Completeness $C$ | 81.8% (3846/4701) |
+| Purity grezza $P_{\text{raw}}$ | 64.51% |
+| **Purity fisica** $P_{\text{phys}}$ | **99.68%** |
+| Falsi positivi: sotto-cut | 2084 (98.5% dei FP) |
+| Falsi positivi: subhalo | 13 |
+| Falsi positivi: doppie | 7 |
+| **Rumore reale** | **12 (0.20%)** |
+| Fit massa $a$ (globale) | 0.884, $\sigma_{\text{MAD}} = 0.133$ dex |
+| Fit massa senza cut | $a = 0.862$, $\sigma_{\text{MAD}} = 0.182$ |
+| Fit massa ben risolti ($>3M_{\text{cut}}$) | $a = 0.926$, $\sigma_{\text{MAD}} = 0.090$ dex |
+| Ceiling completezza $C_{\max}$ | 99.4% (26 FoF non visti dalla rete) |
+| $\Delta a$ dopo background subtraction | $-0.0018$ |
+| Massa rimossa (mediana) | 0.4% |
+
+**Tre pilastri della validazione:**
+1. Purity fisica eccellente: la rete trova materia reale, non rumore.
+2. Completezza limitata dal post-processing, non dalla rete: $C_{\max} = 99.4\%$, gap operativo 17.6 pp dovuto a linking/area filter.
+3. Bias di massa compreso: compressione $a=0.884$ è artefatto della coda a bassa massa; ben risolti a 10% di precisione.
+
+### 1.5 Problemi noti / debito tecnico
+
+- **Bug di connettività 3D sospetto** (individuato dal relatore): nei plot, alcune regioni a probabilità ~0 risultano collegate a regioni a probabilità ~0.95, generando "edge" spuri che uniscono aloni distinti o filament. Da investigare: è un bug di labeling, di soglia, o solo di plotting.
+- **`_find` e `_union_edges` in `extract_blobs` sono dead code** (commento stale).
+- **Due righe duplicate** nel riepilogo §9.1 di NB3.
+- **`same_det`** in §7.1 verifica solo la lunghezza degli array, non l'identità dei blob.
+- **Plot in italiano** in alcune figure (da tradurre in inglese).
+- **Test set LH_106 mai eseguito** — pronto per la blind validation.
+
+### 1.6 Formula del centroide circolare (già studiata, per contesto)
+
+$$\theta_x = \frac{2\pi(x_p + 0.5)}{N_{\text{img}}}, \qquad \bar{x} = \left(\frac{\operatorname{atan2}(\sum \sin\theta_x, \sum\cos\theta_x)}{2\pi} \bmod 1.0\right) \cdot L_{\text{box}}$$
+
+Serve a calcolare il centroide di un blob che può attraversare il bordo periodico del box. La media aritmetica fallirebbe (un alone a $x \approx 24.8$ con pixel a $x \approx 0.2$ darebbe $\bar{x} \approx 12.5$, al centro del box). La media trigonometrica tratta $x$ come angolo su una circonferenza di circonferenza $L_{\text{box}}$ e gestisce il wrap automaticamente.
+
+---
+
+## 2. Diagramma di flusso
+
+### 2.1 Pipeline attuale (baseline)
+
+```
+[Snapshot 090 + cataloghi HDF5]
+        │
+        ▼
+┌───────────────────────────────┐
+│ NB1: make_input_patches       │
+│ ─────────────────────────     │
+│ ckpc/h → Mpc/h (÷1000)        │
+│ SPH smoothing h_i (k=32)      │
+│ 25 slice × 1024²              │
+│ mpu_k = n_k·m_DM / Σ ρ        │
+│ log10 + z-score robusto       │
+│ maschere R_200c (M ≥ 100 m_DM)│
+│ 400 patch 256²                │
+└───────────────────────────────┘
+        │
+        ▼
+┌───────────────────────────────┐
+│ NB2: vera_unet                │
+│ ─────────────────────────     │
+│ Split per simulazione         │
+│ U-Net 1.93M, BCE pesata w=342 │
+│ EMA d=0.995, AdamW, cosine    │
+│ Best ep.17, val AP = 0.8464   │
+│ → val_prob_slices.npy 25×1024²│
+└───────────────────────────────┘
+        │
+        ▼
+┌───────────────────────────────┐
+│ NB3: vera_conn                │
+│ ─────────────────────────     │
+│ Denorm. ρ (margine -2.9)      │
+│ Blob 2D (mosaico 3×3)         │
+│ Centroide circolare           │
+│ Linking 3D (Δs=1,2; scale)    │
+│ Catalogo 3D (x,y,z,M,R_200)   │
+│ Griglia 4×3 → t*=0.95, area=4 │
+│ Matching vs FoF (greedy 1-1)  │
+│ Autopsia FP, HMF, background  │
+└───────────────────────────────┘
+        │
+        ▼
+[C=81.8%, P_phys=99.68%, a=0.884]
+```
+
+### 2.2 Pipeline estesa (proposta, dai prossimi passi)
+
+```
+[Snapshot 090 + cataloghi HDF5]
+        │
+        ├──────────────────────────────────────┐
+        ▼                                      ▼
+┌────────────────────┐            ┌──────────────────────────┐
+│ Rendering standard │            │ Rendering alto contrasto │
+│ (attuale: I = ΣmW) │            │ I1 = Σ m·ρ·W              │
+│                    │            │ I2 = Σ m·W                │
+│                    │            │ T = I1 / I2  (∝ ρ²)       │
+└────────┬───────────┘            └───────────┬──────────────┘
+         │                                    │
+         │                          ┌─────────▼──────────┐
+         │                          │ Dataset high-      │
+         │                          │ contrast           │
+         │                          │ (X_T, Y_mask)      │
+         │                          └─────────┬──────────┘
+         │                                    │
+         ▼                                    ▼
+┌────────────────────┐         ┌──────────────────────────────┐
+│ NB2 standard       │         │ NB2-HC: U-Net su T           │
+│ (baseline)         │         │ Confronto con baseline       │
+└────────┬───────────┘         └───────────┬──────────────────┘
+         │                                │
+         │                                ▼
+         │                  ┌──────────────────────────────┐
+         │                  │ Scelta input definitivo       │
+         │                  │ (T se migliore, altrimenti   │
+         │                  │  I originale)                │
+         │                  └────────────┬─────────────────┘
+         │                               │
+         ▼                               ▼
+┌───────────────────────────────────────────────────────────┐
+│ NB3: catalogo 3D (Group) + calcolo masse su I (non su T)  │
+└───────────────────────────────┬───────────────────────────┘
+                                │
+                                ▼
+                 ┌──────────────────────────────┐
+                 │ CNN subhalo dedicata (T)     │
+                 │ Patch centrate su SubFind    │
+                 │ U-Net piccola (depth=2)      │
+                 │ → catalogo Subhalo           │
+                 └──────────────┬───────────────┘
+                                │
+                                ▼
+                 ┌──────────────────────────────┐
+                 │ Catalogo 3D finale integrato │
+                 │ (Group + Subhalo con flag)   │
+                 └──────────────────────────────┘
+```
+
+---
+
+## 3. Prossimi passi (concordati)
+
+L'ordine è **sequenziale**. Ogni blocco ha un output che sblocca il successivo.
+
+### Blocco 1 — Debug degli "edges" spuri (bug di connettività)
+
+**Obiettivo:** determinare se gli edge che collegano regioni a probabilità ~0 con regioni a probabilità ~0.95 sono un artefatto di plotting o un vero bug nel labeling/connettività.
+
+**Passi:**
+1. Isola una slice (es. 10) e una soglia ($t=0.95$). Estrai `B = probs[s] > t`. Plotta: (a) mappa di probabilità con colorbar; (b) mappa binaria; (c) componenti connesse con label diversa per blob.
+2. Se le componenti mostrano label unite tra regioni lontane → bug nel labeling. Se le label sono corrette ma il plot le unisce → bug nel plotting.
+3. Verifica il mosaico $3\times3$: i pixel del tile centrale devono coincidere con `probs[s] > t`; un blob sul bordo sinistro e uno sul bordo destro devono avere la *stessa* label (periodicità).
+4. Verifica coerenza della soglia (`>` vs `>=`) in `extract_blobs` e `link_blobs`.
+5. Correggi il plotting se il bug è solo visivo (usa `extent=[0, 1024, 0, 1024]`, `contour` su `probs` non su `raw`).
+
+**Output:** cella di diagnostica che mostra `probs`, `B`, `label` per una slice. Commit con il fix.
+
+**Nota dal relatore:** rimuovere gli edge dai plot dove non servono (sono isocontorni, non output della rete).
+
+---
+
+### Blocco 2 — Nuova immagine ad alto contrasto ($T = I_1 / I_2$)
+
+**Obiettivo:** generare una mappa pesata per densità al quadrato, che sopprima il background diffuso e faccia emergere i subhalo. Verificare visivamente che i subhalo emergano. Rigenerare il dataset di training.
+
+**Formule (dalla lavagna del relatore):**
+- Densità locale particella $j$: $\rho_j = \dfrac{32\, m_j}{\frac{4}{3}\pi h_j^3}$ (32 è il numero di vicini SPH).
+- Immagine 1: $I_1 = \sum_j m_j \rho_j W_j$ (pesata per densità).
+- Immagine 2: $I_2 = \sum_j m_j W_j$ (standard).
+- Immagine finale: $T = I_1 / I_2$ (equivalente continuo: $T = \int \rho^2 dz / \int \rho dz$).
+
+**Passi:**
+1. Calcola $\rho_j$ per ogni particella (hai già $h_j$ da Fase 1). Attenzione alle unità: $m_j$ in $M_\odot/h$, $h_j$ in Mpc/h (o ckpc/h, coerente). Salva in cache `.npz`.
+2. Genera $I_1$ e $I_2$ con `sphviewer2`. Verifica se `render` accetta pesi arbitrari (spesso sì, come `weights`/`mass` array). Se no, calcola manualmente con un kernel SPH cubico-spline su griglia $1024^2$ (funzione ~30 righe con `cKDTree`).
+3. Calcola $T = I_1 / I_2$ pixel per pixel; gestisci $I_2 = 0$.
+4. **Verifica visiva:** plotta, per una slice, l'immagine attuale `raw`, la nuova $T$ (scala log), e un ritaglio attorno a un alone massiccio con subhalo noti da SubFind. I subhalo devono essere picchi isolati, il background soppresso.
+5. **Rigenera il dataset:** applica la pipeline di Fase 2 (z-score su $\log_{10} T$, `EMPTY_FILL`, patch $256^2$, maschere $R_{200c}$ identiche a prima) alla nuova immagine. Salva in cartella separata (`sim_LH_*_090_highcontrast/`).
+6. **Nota critica del relatore:** la nuova immagine serve **solo per la detection**, non per il calcolo delle masse. Le masse finali dei blob devono essere calcolate sulla vecchia immagine $I_2$ (densità di superficie standard) usando $\mathrm{mpu}_k$, perché $T$ mescola le masse in modo non lineare.
+
+**Output:** `X_patches_highcontrast.npy`, `Y_mask_patches.npy` (maschere invariate), plot di confronto.
+
+---
+
+### Blocco 3 — Retraining U-Net su immagine ad alto contrasto
+
+**Obiettivo:** verificare se il nuovo input migliora la detection (soprattutto subhalo), mantenendo $C$ e $P_{\text{phys}}$ sui Group.
+
+**Passi:**
+1. Riusa NB2 invariato, cambia solo `DATA_DIR` → cartella high-contrast. Stessi iperparametri: U-Net 1.93M, BCE pesata (ricalcola $w$ sul nuovo train), EMA, cosine, 20 epoche.
+2. Valuta su LH_105 con le metriche esistenti + **nuova metrica: quanti subhalo SubFind vengono trovati** (match pred vs SubFind con $R_{\text{halfmass}}$, non $R_{200c}$).
+3. Tabella di confronto: `input vecchio` vs `input nuovo`, righe = val AP, $C$, $P_{\text{phys}}$, $N_{\text{sub}}$ trovati, $N_{\text{rumore}}$.
+4. **Go/no-go:** se il nuovo input è migliore o pari → adotta $T$ come input standard per la U-Net principale. Se peggiore → tieni il vecchio input per la U-Net e usa $T$ solo per la CNN subhalo (Blocco 4).
+
+**Output:** `best_model_highcontrast.pt`, tabella di confronto.
+
+---
+
+### Blocco 4 — CNN dedicata ai subhalo
+
+**Obiettivo:** rete separata addestrata solo sui subhalo, per identificarli con precisione dentro gli aloni massicci.
+
+**Passi:**
+1. **Dataset subhalo:** da SubFind, prendi tutti i subhalo con $M_{\text{sub}} \ge N_{\min}^{\text{sub}} \cdot m_{\text{DM}}$ ($N_{\min}^{\text{sub}} = 20$ o $50$, da decidere). Per ciascuno:
+   - patch centrata sul subhalo, dimensione $128^2$ o $64^2$ pixel (a risoluzione piena), dall'immagine $T$;
+   - maschera target: disco di raggio $\max(2 R_{\text{halfmass}}, 1.5\,\mathrm{px})$;
+   - **bilanciamento:** includi patch negative (regioni senza subhalo dentro aloni massicci).
+2. **Architettura:** U-Net piccola (depth=2, base=16, ~200k parametri) o CNN fully-convolutional semplice. Inizia piccola; se overfitta, riduci.
+3. **Training:** split per simulazione (train LH_100–104, val LH_105, test LH_106 congelato), BCE pesata, EMA, cosine, 15–20 epoche.
+4. **Valutazione:** object-level, quanti subhalo trovati, purity, area ratio vs SubFind.
+5. **Integrazione:** applica la CNN subhalo alle regioni attorno agli aloni massicci (dove la U-Net principale ha trovato un Group). Blob trovati dentro $R_{200c}$ di un alone principale → etichetta *subhalo*; altri → *aloni indipendenti*.
+6. **Validazione end-to-end:** confronta catalogo finale (Group + subhalo) con cataloghi veri, matching greedy 1-a-1, $C$ e $P_{\text{phys}}$ separati per Group e subhalo.
+
+**Output:** `best_model_subhalo.pt`, `subhalo_catalog.npy`, tabella di confronto con SubFind.
+
+---
+
+## 4. Priorità e tempistiche suggerite
+
+| Settimana | Attività |
+|---|---|
+| 1 | Blocco 1 (edges) + inizio Blocco 2 (calcolo $\rho_j$, prima implementazione $T$) |
+| 2 | Blocco 2 completo (verifica visiva, rigenerazione dataset) |
+| 3 | Blocco 3 (retraining U-Net su $T$, confronto con baseline) |
+| 4–5 | Blocco 4 (dataset subhalo, training CNN, integrazione) |
+
+I punti lasciati in sospeso (non urgenti): traduzione plot in inglese, fix duplicati §9.1 di NB3, `same_det` robustness, blind test LH_106, centroide (già risolto dall'autore).
+
+---
+
+## 5. Rischi noti e mitigazioni
+
+| Rischio | Mitigazione |
+|---|---|
+| `sphviewer2` non accetta pesi arbitrari per $I_1$ | Calcolo manuale con kernel SPH su griglia $1024^2$ |
+| $T$ peggiora detection Group | Tieni vecchio input per U-Net principale; usa $T$ solo per CNN subhalo |
+| Subhalo troppo piccoli anche ad alto contrasto | Patch ritagliate attorno al subhalo (non mappa intera), così la rete vede il subhalo centrale |
+| SubFind ha oggetti non fisici | Taglio $N_{\min}^{\text{sub}}$, escludi $R_{\text{halfmass}} = 0$ |
+| Il bug edges non è solo di plotting | Correggi `extract_blobs`/`link_blobs` prima del Blocco 3 |
+
+---
+
+## 6. Contatti e materiale
+
+- **Autore tesi:** [nome]
+- **Relatore:** [nome]
+- **Notebook:** `make_input_patches.ipynb` (NB1), `unet.ipynb` (NB2), `conn.ipynb` (NB3)
+- **Artefatti salvati:** `X_patches.npy`, `Y_mask_patches.npy`, `mpu_per_slice.npy`, `dataset_info.json`, `best_model.pt`, `val_prob_slices.npy`, `candidate_thresholds.json`, `threshold_sweep.json`, `chosen_threshold.json`, `config.json`, `history.json`
+
